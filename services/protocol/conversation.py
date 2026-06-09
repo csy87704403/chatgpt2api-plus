@@ -63,6 +63,20 @@ def image_stream_error_message(message: str) -> str:
     return text or "image generation failed"
 
 
+def is_preflight_retryable_image_error(message: str) -> bool:
+    lower = str(message or "").lower()
+    return (
+        "curl: (28)" in lower
+        or "operation timed out" in lower
+        or "connection timed out" in lower
+        or "curl: (35)" in lower
+        or "tls connect error" in lower
+        or "openssl_internal" in lower
+        or "connection reset" in lower
+        or "remote disconnected" in lower
+    )
+
+
 def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
     return [base64.b64encode(data).decode("ascii") for data, _, _ in images if data]
 
@@ -142,6 +156,73 @@ def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> 
     return f"{prompt.strip()}\n\n{''.join(hints)}" if hints else prompt
 
 
+TRANSPARENT_BACKGROUND_HINT = (
+    "Transparent background requirement: return a real PNG with an alpha channel. "
+    "Do not render a white, solid, checkerboard, or screenshot-style background. "
+    "The background pixels must be fully transparent."
+)
+
+TRANSPARENT_BACKGROUND_VALUES = {"transparent", "alpha", "true", "1", "yes", "on"}
+
+TRANSPARENT_IMAGE_POLL_TIMEOUT_SECS = 180
+
+TRANSPARENT_PROMPT_MARKERS = (
+    "透明",
+    "背景透明",
+    "透明底",
+    "去背",
+    "扣出来",
+    "抠出来",
+    "transparent",
+    "alpha channel",
+    "no background",
+)
+
+
+def wants_transparent_background(prompt: str, background: str | None = None) -> bool:
+    value = str(background or "").strip().lower()
+    if value in TRANSPARENT_BACKGROUND_VALUES:
+        return True
+    text = str(prompt or "").lower()
+    return any(marker in text for marker in TRANSPARENT_PROMPT_MARKERS)
+
+
+def prompt_for_transparent_background(prompt: str, background: str | None = None) -> str:
+    if not wants_transparent_background(prompt, background):
+        return prompt
+    clean_prompt = str(prompt or "").strip()
+    if TRANSPARENT_BACKGROUND_HINT in clean_prompt:
+        return clean_prompt
+    return f"{clean_prompt}\n\n{TRANSPARENT_BACKGROUND_HINT}"
+
+
+def png_has_alpha_channel(data: bytes) -> bool:
+    if len(data) < 33 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        return False
+    offset = 8
+    while offset + 8 <= len(data):
+        chunk_len = int.from_bytes(data[offset:offset + 4], "big")
+        chunk_type = data[offset + 4:offset + 8]
+        chunk_data_start = offset + 8
+        chunk_end = chunk_data_start + chunk_len
+        if chunk_end + 4 > len(data):
+            return False
+        if chunk_type == b"IHDR":
+            if chunk_len < 10:
+                return False
+            color_type = data[chunk_data_start + 9]
+            if color_type in {4, 6}:
+                return True
+            if color_type not in {0, 2, 3}:
+                return False
+        elif chunk_type == b"tRNS":
+            return True
+        elif chunk_type == b"IDAT":
+            return False
+        offset = chunk_end + 4
+    return False
+
+
 def encoding_for_model(model: str):
     try:
         return tiktoken.encoding_for_model(model)
@@ -185,16 +266,20 @@ def format_image_result(
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         if response_format == "b64_json":
-            data.append({
+            result_item = {
                 "b64_json": b64_json,
                 "url": save_image_bytes(base64.b64decode(b64_json), base_url),
                 "revised_prompt": revised_prompt,
-            })
+            }
         else:
-            data.append({
+            result_item = {
                 "url": save_image_bytes(base64.b64decode(b64_json), base_url),
                 "revised_prompt": revised_prompt,
-            })
+            }
+        for key in ("transparent_background", "transparent_verified"):
+            if key in item:
+                result_item[key] = item[key]
+        data.append(result_item)
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if message and not data:
         result["message"] = message
@@ -212,6 +297,7 @@ class ConversationRequest:
     quality: str = "auto"
     response_format: str = "b64_json"
     base_url: str | None = None
+    background: str | None = None
     message_as_error: bool = False
 
 
@@ -539,9 +625,11 @@ def stream_image_outputs(
         total: int = 1,
 ) -> Iterator[ImageOutput]:
     last: dict[str, Any] = {}
+    transparent_requested = wants_transparent_background(request.prompt, request.background)
+    upstream_prompt = prompt_for_transparent_background(request.prompt, request.background)
     for event in conversation_events(
             backend,
-            prompt=request.prompt,
+            prompt=upstream_prompt,
             model=request.model,
             images=request.images or [],
             size=request.size,
@@ -589,12 +677,29 @@ def stream_image_outputs(
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message)
         return
 
-    image_urls = backend.resolve_conversation_image_urls(conversation_id, file_ids, sediment_ids)
+    image_poll_timeout = TRANSPARENT_IMAGE_POLL_TIMEOUT_SECS if transparent_requested else None
+    image_urls = backend.resolve_conversation_image_urls(
+        conversation_id,
+        file_ids,
+        sediment_ids,
+        poll_timeout_secs=image_poll_timeout,
+    )
     if image_urls:
-        image_items = [
-            {"b64_json": base64.b64encode(image_data).decode("ascii")}
-            for image_data in backend.download_image_bytes(image_urls)
-        ]
+        image_items = []
+        for image_data in backend.download_image_bytes(image_urls):
+            if transparent_requested and not png_has_alpha_channel(image_data):
+                raise ImageGenerationError(
+                    "上游返回的是 PNG，但没有 alpha 透明通道；这说明本次结果不是真正的透明背景 PNG。"
+                    "请调整提示词后重试，或换一个可稳定触发透明背景能力的账号。",
+                    status_code=422,
+                    error_type="invalid_request_error",
+                    code="transparent_png_not_returned",
+                )
+            item = {"b64_json": base64.b64encode(image_data).decode("ascii")}
+            if transparent_requested:
+                item["transparent_background"] = True
+                item["transparent_verified"] = True
+            image_items.append(item)
         data = format_image_result(
             image_items,
             request.prompt,
@@ -617,12 +722,18 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     emitted = False
     last_error = ""
     for index in range(1, request.n + 1):
+        attempted_tokens: set[str] = set()
         while True:
             try:
-                token = account_service.get_available_access_token()
+                token = account_service.get_available_access_token(attempted_tokens)
+                attempted_tokens.add(token)
             except RuntimeError as exc:
                 if emitted:
                     return
+                if last_error:
+                    raise ImageGenerationError(
+                        "all available image accounts failed, last error: " + image_stream_error_message(last_error)
+                    ) from exc
                 raise ImageGenerationError(str(exc) or "image generation failed") from exc
 
             emitted_for_token = False
@@ -663,6 +774,8 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                         token = refreshed_token
                         continue
                     account_service.remove_invalid_token(token, "image_stream")
+                    continue
+                if not emitted_for_token and is_preflight_retryable_image_error(last_error):
                     continue
                 raise ImageGenerationError(image_stream_error_message(last_error)) from exc
 

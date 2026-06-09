@@ -69,6 +69,7 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "model": task.get("model"),
         "size": task.get("size"),
         "quality": task.get("quality"),
+        "background": task.get("background"),
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
     }
@@ -111,6 +112,7 @@ class ImageTaskService:
         model: str,
         size: str | None,
         quality: str = "auto",
+        background: str | None = None,
         base_url: str = "",
     ) -> dict[str, Any]:
         payload = {
@@ -119,6 +121,7 @@ class ImageTaskService:
             "n": 1,
             "size": size,
             "quality": quality,
+            "background": background,
             "response_format": "url",
             "base_url": base_url,
         }
@@ -133,6 +136,7 @@ class ImageTaskService:
         model: str,
         size: str | None,
         quality: str = "auto",
+        background: str | None = None,
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
     ) -> dict[str, Any]:
@@ -143,6 +147,7 @@ class ImageTaskService:
             "n": 1,
             "size": size,
             "quality": quality,
+            "background": background,
             "response_format": "url",
             "base_url": base_url,
         }
@@ -202,6 +207,7 @@ class ImageTaskService:
                 "model": _clean(payload.get("model"), "gpt-image-2"),
                 "size": _clean(payload.get("size")),
                 "quality": _clean(payload.get("quality"), "auto"),
+                "background": _clean(payload.get("background")) or None,
                 "created_at": now,
                 "updated_at": now,
             }
